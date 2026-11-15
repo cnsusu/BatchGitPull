@@ -855,6 +855,7 @@ class App:
         self.tree.tag_configure("run", foreground="#0969da")
         self.tree.tag_configure("muted", foreground="#808080")
         self.tree.tag_configure("warn", foreground="#bc4c00")
+        self.tree.tag_configure("dirty", foreground="#8250df")
         self.tree.bind("<Button-1>", self._on_click)
         self.tree.bind("<Double-1>", self._on_double)
         self.tree.bind("<Button-3>", self._on_right_click)
@@ -905,8 +906,12 @@ class App:
         values = ("☑" if r["checked"] else "☐", r["repo"].name, r["repo"].branch,
                   sync_text(sync), r["status"], r["message"], t)
         tag = STATUS_TAG.get(r["status"])
+        # 有未提交改动/冲突时用单独的紫色，与「待拉取/未推送」等橙色区分；拉取失败仍显示红色
+        dirty = r["checked"] and sync is not None and (sync.changed or sync.conflicts)
         if r["status"] == ST_IDLE and r["checked"] and sync is not None:
-            tag = "warn" if sync_parts(sync) else None
+            tag = "dirty" if dirty else ("warn" if sync_parts(sync) else None)
+        elif dirty and r["status"] in (ST_UPDATED, ST_UPTODATE):
+            tag = "dirty"
         # 未勾选：不再检查，整行置灰，保留上次结果仅供参考
         self.tree.item(iid, values=values, tags=(tag,) if tag else ())
 
@@ -1320,6 +1325,12 @@ class App:
         if iid not in self.rows or res.cancelled:
             return
         r = self.rows[iid]
+        prev = r["sync"]
+        # 仅本地检查（有上游却既未获取也无获取错误）不知道远端是否可达：沿用上次的获取失败，
+        # 否则拉取后的本地刷新会把「远端获取失败」变成「已同步」
+        if (res.ok and res.upstream and not res.fetched and not res.fetch_error
+                and prev is not None and prev.fetch_error and prev.upstream == res.upstream):
+            res.fetch_error = prev.fetch_error
         r["sync"] = res
         if res.ok and res.branch and res.branch != r["repo"].branch:
             r["repo"] = Repo(r["repo"].name, r["repo"].path, res.branch)  # 用户在别处切了分支
@@ -1445,8 +1456,11 @@ class App:
         elif kind == "result":
             iid, res = ev[1], ev[2]
             if iid in self.rows:
-                self.rows[iid].update(status=res.status, message=res.message,
-                                      detail=res.detail, seconds=res.seconds)
+                row = self.rows[iid]
+                row.update(status=res.status, message=res.message,
+                           detail=res.detail, seconds=res.seconds)
+                if res.status in (ST_UPDATED, ST_UPTODATE) and row["sync"] is not None:
+                    row["sync"].fetch_error = ""  # 拉取成功说明远端已可达
                 self._render_row(iid)
                 if iid in self.tree.selection():
                     self._show_detail()
