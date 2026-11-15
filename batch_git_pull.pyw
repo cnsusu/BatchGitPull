@@ -725,6 +725,11 @@ class App:
         self.check_quiet = False
         self.check_after = None      # 自动检查定时器
         self.last_check = 0.0        # 上次检查结束的 monotonic 时间
+        self.last_fetch = 0.0        # 最近一次含 fetch 的检查的开始时间（time.time）
+        self.check_started = 0.0
+        self.check_full = True
+        self.check_iids = set()
+        self.stale_after = None      # 重新勾选后的补查定时器
         self.pending_pull = None     # 检查进行中时点了拉取：(only,)，检查停止后再开始
 
         self._setup_style()
@@ -900,12 +905,13 @@ class App:
         values = ("☑" if r["checked"] else "☐", r["repo"].name, r["repo"].branch,
                   sync_text(sync), r["status"], r["message"], t)
         tag = STATUS_TAG.get(r["status"])
-        if r["status"] == ST_IDLE and sync is not None:
+        if r["status"] == ST_IDLE and r["checked"] and sync is not None:
             tag = "warn" if sync_parts(sync) else None
+        # 未勾选：不再检查，整行置灰，保留上次结果仅供参考
         self.tree.item(iid, values=values, tags=(tag,) if tag else ())
 
     def _update_sync_summary(self):
-        infos = [r["sync"] for r in self.rows.values() if r["sync"] is not None]
+        infos = [r["sync"] for r in self.rows.values() if r["checked"] and r["sync"] is not None]
         if self.checking:
             self.sync_var.set("正在检查本地/远端状态…")
             return
@@ -1038,6 +1044,9 @@ class App:
             if iid in self.rows:
                 self.rows[iid]["checked"] = value_fn(self.rows[iid])
                 self._render_row(iid)
+        self._update_sync_summary()
+        if self._stale_checked():
+            self._schedule_stale_check()
 
     def check_all(self):
         self._set_checked(list(self.rows), lambda r: True)
@@ -1148,6 +1157,8 @@ class App:
                 when = time.strftime("%H:%M:%S", time.localtime(sync.checked_at))
                 how = "已获取远端" if sync.fetched else "仅本地，未获取远端"
                 lines.append(f"本地/远端：{sync_text(sync)}（检查于 {when}，{how}）")
+                if not r["checked"]:
+                    lines.append("（未勾选，已暂停检查；以上为勾选时的最后结果）")
                 if sync.upstream:
                     lines.append(f"上游分支：{sync.upstream}")
                 if sync.fetch_error:
@@ -1263,17 +1274,26 @@ class App:
         except ValueError:
             return DEFAULT_JOBS
 
-    def start_check(self, fetch=True, quiet=False):
-        """fetch=True：先获取远端再看状态；quiet=True：完成后不改左侧状态栏。返回是否已启动。"""
-        if self.running or self.scanning or self.checking or not self.rows or self.destroyed:
+    def start_check(self, fetch=True, quiet=False, only=None):
+        """只检查已勾选的仓库（未勾选的不 fetch、不看状态）。
+        fetch=True：先获取远端再看状态；quiet=True：完成后不改左侧状态栏；
+        only：只检查其中这些行（重新勾选后补查）。返回是否已启动。"""
+        if self.running or self.scanning or self.checking or self.destroyed:
+            return False
+        iids = [iid for iid, r in self.rows.items()
+                if r["checked"] and (only is None or iid in only)]
+        if not iids:
             return False
         self.checking = True
         self.check_quiet = quiet
+        self.check_full = only is None
+        self.check_started = time.time()
         self.check_token = CancelToken()
         self.check_gen += 1
         self._update_controls()
         self._update_sync_summary()
-        items = [(iid, r["repo"]) for iid, r in self.rows.items()]
+        self.check_iids = set(iids)
+        items = [(iid, self.rows[iid]["repo"]) for iid in iids]
         threading.Thread(target=self._check_worker,
                          args=(self.check_gen, items, fetch, self._jobs(), self.check_token),
                          daemon=True).start()
@@ -1318,10 +1338,33 @@ class App:
             self.pending_pull = None
             self.start_pull(only)
             return
-        if fetch and not cancelled:
+        if fetch and not cancelled and self.check_full:
+            # 只有全量检查才推进基准时间；补查若也推进，会把其他行判成过期而循环重查
+            self.last_fetch = self.check_started
             self._schedule_auto_check()
         if not self.check_quiet and not cancelled:
             self._set_status(f"状态检查完成：{self.sync_var.get()}")
+        if not cancelled:
+            self._check_stale(exclude=self.check_iids)  # 检查期间新勾选的仓库
+
+    def _stale_checked(self):
+        """已勾选、但从没检查过或上次结果早于最近一次获取远端的行。"""
+        return [iid for iid, r in self.rows.items() if r["checked"] and
+                (r["sync"] is None or r["sync"].checked_at < self.last_fetch)]
+
+    def _schedule_stale_check(self):
+        # 防抖：连续点「全选」/勾选多行时合并成一次检查
+        if self.stale_after is not None:
+            self.root.after_cancel(self.stale_after)
+        self.stale_after = self.root.after(600, self._check_stale)
+
+    def _check_stale(self, exclude=()):
+        self.stale_after = None
+        # exclude：刚查过的行即使结果异常也不立刻重查，避免循环
+        stale = [iid for iid in self._stale_checked() if iid not in exclude]
+        if stale:
+            # 正在检查时会在 _on_check_done 里再调用一次
+            self.start_check(True, quiet=True, only=set(stale))
 
     def _schedule_auto_check(self, delay_ms=None):
         if self.check_after is not None:
@@ -1333,8 +1376,10 @@ class App:
 
     def _auto_check(self):
         self.check_after = None
-        if not self.start_check(True, quiet=True):
-            self._schedule_auto_check(60_000)  # 正忙，1 分钟后再试
+        if self.start_check(True, quiet=True):
+            return
+        busy = self.running or self.scanning or self.checking
+        self._schedule_auto_check(60_000 if busy else None)  # 正忙则 1 分钟后再试
 
     def _on_interval(self, _e=None):
         label = self.interval_var.get()
